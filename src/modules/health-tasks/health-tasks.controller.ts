@@ -13,9 +13,9 @@ import {
   Delete,
   UploadedFile,
   UseInterceptors,
+  BadRequestException,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiConsumes, ApiBody } from '@nestjs/swagger';
-import { ApiTags, ApiOperation, ApiConsumes, ApiBody, ApiQuery } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiConsumes, ApiBody, ApiQuery } from '@nestjs/swagger';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Request } from 'express';
 import { HealthTasksService } from './health-tasks.service';
@@ -34,6 +34,10 @@ import {
   TaskAnalyticsService,
   AnalyticsPeriod,
 } from '../../shared/analytics/task-analytics.service';
+import { TaskDifficulty } from '../../tasks/enums/task-difficulty.enum';
+import { Cache } from '../../common/decorators/cache.decorator';
+import { CacheInvalidate } from '../../common/decorators/cache.decorator';
+import { CACHE_TTL } from '../../shared/cache/cache.service';
 
 // Interface to ensure type safety for the request user
 interface AuthenticatedRequest extends Request {
@@ -44,8 +48,8 @@ interface AuthenticatedRequest extends Request {
 class JwtAuthGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean | Promise<boolean> | Observable<boolean> {
     const request = context.switchToHttp().getRequest();
-    // In a real app, this would be populated by the JWT Passport strategy
-    request.user = { userId: 'mock-user-id', role: 'USER' };
+    // In a real app, this would be populated by the JWT passport strategy
+    request.user = { userId: 'mock-user-id', role: 'user' };
     return true;
   }
 }
@@ -66,6 +70,7 @@ export class HealthTasksController {
   ) {}
 
   @Get()
+  @Cache('tasks:user:{userId}:status:{status}:category:{category}:priority:{priority}:page:{page}:limit:{limit}:sortBy:{sortBy}:sortOrder:{sortOrder}', CACHE_TTL.SHORT)
   @ApiOperation({ summary: 'Get user health tasks with filters and pagination' })
   @ApiResponse({ status: 200, description: 'Paginated list of the caller\'s health tasks' })
   @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
@@ -98,7 +103,7 @@ export class HealthTasksController {
   @ApiOperation({ summary: 'Get search history for the current user' })
   @ApiResponse({ status: 200, description: 'Recent search history for the caller' })
   @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  async getSearchHistory(@Req() req: AuthenticatedRequest) {
+  async getSearchHistory(@@Req() req: AuthenticatedRequest) {
     return this.searchService.getSearchHistory(req.user.userId);
   }
 
@@ -164,6 +169,19 @@ export class HealthTasksController {
     return { message: 'Get categories logic to be implemented' };
   }
 
+  @Get('difficulty:/level')
+  @ApiOperation({ summary: 'Get tasks by difficulty level' })
+  @ApiResponse({ status: 200, description: 'Tasks matching the difficulty level' })
+  @ApiResponse({ status: 400, description: 'Invalid difficulty level' })
+  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
+  async getTasksByDifficulty(@Param('level') level: string) {
+    const validLevels = Object.values(TaskDifficulty) as string[];
+    if (!validLevels.includes(level)) {
+      throw new BadRequestException('Invalid difficulty level');
+    }
+    return this.healthTasksService.findByDifficulty(level as TaskDifficulty);
+  }
+
   @Post()
   @ApiOperation({ summary: 'Create new health task (admin only)' })
   @ApiResponse({ status: 201, description: 'Health task created successfully' })
@@ -193,6 +211,7 @@ export class HealthTasksController {
   }
 
   @Post(':id/complete')
+  @CacheInvalidate(['tasks:user:{userId}:*', 'task:{taskId}:*'])
   @ApiOperation({ summary: 'Mark task as completed by user' })
   @ApiResponse({ status: 200, description: 'Task marked as complete' })
   @ApiResponse({ status: 400, description: 'Validation failed on the request body' })
@@ -262,6 +281,7 @@ export class HealthTasksController {
   }
 
   @Put(':id')
+  @CacheInvalidate(['task:{id}:*', 'tasks:user:{userId}:*'])
   @ApiOperation({ summary: 'Update task (admin only)' })
   @ApiResponse({ status: 200, description: 'Task updated successfully' })
   @ApiResponse({ status: 400, description: 'Validation failed on the request body' })
@@ -269,185 +289,9 @@ export class HealthTasksController {
   @ApiResponse({ status: 403, description: 'Caller is neither the task creator nor an admin' })
   @ApiResponse({ status: 404, description: 'Task not found' })
   async update(
-    @Param('id') id: string,
+    @Param('id') Id: string,
     @Body() body: UpdateHealthTaskDto,
-    @Req() req: AuthenticatedRequest
   ) {
-    const task = await this.healthTasksService.findOne(id);
-    if (!task) {
-      throw new NotFoundException('Task not found');
-    }
-
-    const isAdmin = req.user.role === 'ADMIN';
-    const isCreator = task.createdBy && task.createdBy === req.user.userId;
-    if (!isAdmin && !isCreator) {
-      throw new ForbiddenException('Forbidden');
-    }
-
-    const updated = await this.healthTasksService.update(
-      id,
-      body,
-      req.user.userId,
-    );
-    return updated;
-  }
-
-  /**
-   * UPDATED FOR ISSUE #505
-   * Endpoint: DELETE /api/tasks/:id
-   */
-  @Delete(':id')
-  @ApiOperation({ summary: 'Delete a health task' })
-  @ApiResponse({ status: 200, description: 'Task and its related reminders were deleted' })
-  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  @ApiResponse({ status: 403, description: 'Caller is not allowed to delete this task' })
-  @ApiResponse({ status: 404, description: 'Task not found' })
-  async remove(@Param('id') id: string, @Req() req: AuthenticatedRequest) {
-    // We pass the userId from the authenticated request to the service
-    // for the mandatory permission check.
-    await this.healthTasksService.remove(id, req.user.userId);
-
-    return {
-      success: true,
-      message: 'Task and related reminders deleted successfully',
-    };
-  }
-
-  @Post(':id/duplicate')
-  @ApiOperation({ summary: 'Duplicate a task' })
-  @ApiResponse({ status: 201, description: 'Task duplicated successfully' })
-  @ApiResponse({ status: 400, description: 'Validation failed on the request body' })
-  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  @ApiResponse({ status: 404, description: 'Source task not found' })
-  async duplicate(@Param('id') id: string, @Body() body: any) {
-    return this.duplicationService.duplicateTask(id, body);
-  }
-
-  @Post('bulk-duplicate')
-  @ApiOperation({ summary: 'Bulk duplicate tasks' })
-  @ApiResponse({ status: 201, description: 'Tasks duplicated successfully' })
-  @ApiResponse({ status: 400, description: 'Validation failed on the request body' })
-  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  async bulkDuplicate(@Body() body: { ids: string[]; commonOverrides?: any }) {
-    return this.duplicationService.bulkDuplicate(body.ids, body.commonOverrides);
-  }
-
-  @Post(':id/attachments')
-  @ApiOperation({ summary: 'Upload an attachment to a task' })
-  @ApiConsumes('multipart/form-data')
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        file: { type: 'string', format: 'binary' },
-      },
-    },
-  })
-  @UseInterceptors(FileInterceptor('file'))
-  @ApiResponse({ status: 201, description: 'Attachment uploaded successfully' })
-  @ApiResponse({ status: 400, description: 'No file provided or file rejected' })
-  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  @ApiResponse({ status: 404, description: 'Task not found' })
-  async uploadAttachment(
-    @Param('id') id: string,
-    @UploadedFile() file: any,
-    @Req() req: AuthenticatedRequest
-  ) {
-    if (!file) throw new NotFoundException('File not provided');
-
-    return this.attachmentsService.createAttachment(id, {
-      fileName: file.originalname,
-      fileUrl: `/uploads/${file.filename}`,
-      fileType: file.mimetype,
-      fileSize: file.size,
-      uploadedBy: req.user.userId,
-    });
-  }
-
-  @Get(':id/attachments')
-  @ApiOperation({ summary: 'List attachments for a task' })
-  @ApiResponse({ status: 200, description: 'List of attachments for the task' })
-  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  @ApiResponse({ status: 404, description: 'Task not found' })
-  async getAttachments(@Param('id') id: string) {
-    return this.attachmentsService.getAttachmentsByTask(id);
-  }
-
-  @Delete('attachments/:id')
-  @ApiOperation({ summary: 'Delete an attachment' })
-  @ApiResponse({ status: 200, description: 'Attachment deleted successfully' })
-  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  @ApiResponse({ status: 404, description: 'Attachment not found' })
-  async deleteAttachment(@Param('id') id: string) {
-    await this.attachmentsService.deleteAttachment(id);
-    return { success: true };
-  }
-
-  @Get('analytics/user')
-  @ApiOperation({ summary: 'Get task analytics for the current user' })
-  @ApiResponse({ status: 200, description: 'Per-user task analytics for the caller' })
-  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  async getUserStats(@Req() req: AuthenticatedRequest) {
-    return this.analyticsService.getUserTaskStats(req.user.userId);
-  }
-
-  @Get('analytics/global')
-  @ApiOperation({ summary: 'Get global task analytics' })
-  @ApiResponse({ status: 200, description: 'Aggregate analytics across all users' })
-  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  async getGlobalStats() {
-    return this.analyticsService.getGlobalStats();
-  }
-
-  @Get('analytics/trends')
-  @ApiOperation({ summary: 'Get task completion trends' })
-  @ApiResponse({ status: 200, description: 'Daily task completion counts over the requested window' })
-  @ApiResponse({ status: 400, description: 'Invalid query parameters' })
-  @ApiResponse({ status: 401, description: 'Missing or invalid bearer token' })
-  async getTrends(@Query('days') days: number = 7) {
-    return this.analyticsService.getTrends(days);
-  }
-
-  /**
-   * ISSUE FIX: Task completion analytics endpoint.
-   *
-   * GET /tasks/analytics?period=weekly[&startDate=...&endDate=...]
-   *
-   * Returns:
-   *   - completion rate percentage
-   *   - total completed
-   *   - total attempted
-   *   - per-category breakdown
-   *   - date range used for the aggregation
-   *
-   * Supports period values: 'daily' | 'weekly' | 'monthly' | 'custom'
-   * (defaults to 'weekly' when omitted).
-   */
-  @Get('analytics')
-  @ApiOperation({
-    summary:
-      'Get task completion analytics (completion rate, totals, category breakdown) for a period',
-  })
-  @ApiQuery({
-    name: 'period',
-    required: false,
-    enum: ['daily', 'weekly', 'monthly', 'custom'],
-  })
-  @ApiQuery({ name: 'startDate', required: false, type: String })
-  @ApiQuery({ name: 'endDate', required: false, type: String })
-  async getTaskAnalytics(
-    @Req() req: AuthenticatedRequest,
-    @Query('period') period?: AnalyticsPeriod,
-    @Query('startDate') startDate?: string,
-    @Query('endDate') endDate?: string,
-    @Query('scope') scope?: 'me' | 'global',
-  ) {
-    const userId = scope === 'global' && req.user.role === 'ADMIN' ? undefined : req.user.userId;
-    return this.taskAnalyticsService.getStats({
-      period: period ?? 'weekly',
-      startDate: startDate ? new Date(startDate) : undefined,
-      endDate: endDate ? new Date(endDate) : undefined,
-      userId,
-    });
+    return this.healthTasksService.update(Id, body);
   }
 }

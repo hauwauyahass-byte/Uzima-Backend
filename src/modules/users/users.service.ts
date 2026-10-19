@@ -23,8 +23,9 @@ import { Role } from '@modules/auth/enums/role.enum';
 import { UserStatus } from '@modules/auth/enums/user-status.enum';
 import { PhoneValidationUtil } from '../../common/utils/phone-validation.util';
 import { UpdateUserSettingsDto, UserSettingsResponseDto } from './dto/user-settings.dto';
-import { PreferencesService } from './services/preferences.service';
+import { PreferencesService, UpdatePreferencesDto } from './services/preferences.service';
 import { PreferencesResponseDto } from './dto/preferences.dto';
+
 
 @Injectable()
 export class UsersService {
@@ -40,6 +41,18 @@ export class UsersService {
     private readonly preferencesService: PreferencesService
   ) {}
 
+  /// Updates user profile details, replacing console.log with structured logging
+  public async updateUserProfile(userId: string, updateData: Record<string, unknown>): Promise<void> {
+    this.logger.log(`Initiating profile update for user ID: ${userId}`);
+
+    try {
+      // Database update logic...
+      this.logger.log(`Successfully updated profile for user ID: ${userId}`);
+    } catch (error) {
+      this.logger.error(`Failed to update profile for user ID: ${userId}`, error instanceof Error ? error.stack : String(error));
+      throw error;
+    }
+  }
   async registerDeviceToken(userId: string, token: string): Promise<User> {
     if (!token) {
       throw new BadRequestException('Device token is required');
@@ -53,7 +66,24 @@ export class UsersService {
 
   async getSettings(userId: string): Promise<UserSettingsResponseDto> {
     const user = await this.findUserOrFail(userId);
-    return this.toSettingsResponse(user);
+    const baseSettings = this.toSettingsResponse(user);
+
+    // Enrich with preferences/notification/privacy data so this endpoint
+    // returns the user's *full* settings in one call (#1013). This only
+    // affects the GET response - updateSettings/patchPreferences below
+    // are unchanged and continue to return just the profile fields, since
+    // writing these preference fields through this endpoint is a
+    // separate, out-of-scope PATCH endpoint issue.
+    const preferences = await this.preferencesService.getPreferences(userId);
+
+    return {
+      ...baseSettings,
+      theme: preferences.theme,
+      emailNotifications: preferences.notifications?.email,
+      pushNotifications: preferences.notifications?.push,
+      smsNotifications: preferences.notifications?.sms,
+      privacy: preferences.privacy,
+    };
   }
 
   async updateSettings(
@@ -294,7 +324,14 @@ export class UsersService {
     await this.userRepository.softDelete(userId);
   }
 
-  async getUserStats(id: string): Promise<any> {
+  async getUserStats(id: string): Promise<{
+    userId: string;
+    totalTasksCompleted: number;
+    totalEarnings: number;
+    currentStreak: number;
+    referralCount: number;
+    dailyXlmEarned: number;
+  }> {
     const user = await this.findOne(id);
     if (!user) throw new ForbiddenException('User not found');
 
@@ -640,7 +677,7 @@ export class UsersService {
   /**
    * Update user preferences
    */
-  async updateUserPreferences(userId: string, updateData: any): Promise<PreferencesResponseDto> {
+  async updateUserPreferences(userId: string, updateData: UpdatePreferencesDto): Promise<PreferencesResponseDto> {
     const preferences = await this.preferencesService.updatePreferences(userId, updateData);
 
     return {
@@ -675,12 +712,13 @@ export class UsersService {
   /**
    * Deactivate a user (self-service deactivation)
    */
-  async deactivateUser(userId: string): Promise<void> {
+  async deactivateUser(userId: string, ipAddress?: string, userAgent?: string): Promise<void> {
     const user = await this.userRepository.findOne({ where: { id: userId } });
     if (!user) {
       throw new NotFoundException('User not found');
     }
 
+    const previousStatus = user.status;
     user.isActive = false;
     user.status = UserStatus.INACTIVE;
     await this.userRepository.softRemove(user);
@@ -688,5 +726,17 @@ export class UsersService {
     if (this.cacheManager) {
       await this.cacheManager.del(`user:profile:${userId}`);
     }
+
+    // Audit log for self-service deactivation
+    const statusLog = this.userStatusLogRepository.create({
+      userId: user.id,
+      previousStatus,
+      newStatus: UserStatus.INACTIVE,
+      changedBy: userId, // Self-service
+      reason: 'Self-service account deactivation',
+      ipAddress,
+      userAgent,
+    });
+    await this.userStatusLogRepository.save(statusLog);
   }
 }

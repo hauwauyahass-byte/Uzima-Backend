@@ -1,3 +1,4 @@
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { IsEnum, IsOptional, IsString, IsUrl } from 'class-validator';
 
 export enum ProofType {
@@ -8,12 +9,15 @@ export enum ProofType {
 }
 
 export class CompleteTaskDto {
+  @ApiProperty({ description: 'ID of the task to complete', example: '123e4567-e89b-12d3-a456-426614174000' })
   @IsString()
   taskId: string;
 
+  @ApiProperty({ description: 'Type of proof submitted for task completion', enum: ProofType, example: ProofType.PHOTO })
   @IsEnum(ProofType)
   proofType: ProofType;
 
+  @ApiPropertyOptional({ description: 'Presigned upload URL returned by the task-proof upload endpoint', example: 'https://bucket.s3.amazonaws.com/proofs/user-id/task-id/123?X-Amz-Signature=...' })
   @IsOptional()
   @IsUrl()
   proofUrl?: string;

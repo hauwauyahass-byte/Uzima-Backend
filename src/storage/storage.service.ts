@@ -7,6 +7,7 @@ import {
   GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class StorageService {
@@ -14,10 +15,12 @@ export class StorageService {
   private readonly logger = new Logger(StorageService.name);
   private bucketName: string;
 
-  constructor() {
-    const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
-    const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
-    this.bucketName = process.env.AWS_S3_BUCKET_NAME || '';
+  constructor(
+    private readonly configService: ConfigService,
+  ) {
+    const accessKeyId = this.configService.get<string>('AWS_ACCESS_KEY_ID');
+    const secretAccessKey = this.configService.get<string>('AWS_SECRET_ACCESS_KEY');
+    this.bucketName = this.configService.get<string>('AWS_S3_BUCKET_NAME') || '';
 
     if (!accessKeyId || !secretAccessKey) {
       this.logger.error('AWS Credentials are missing from environment variables!');
@@ -25,12 +28,12 @@ export class StorageService {
     }
 
     this.s3Client = new S3Client({
-      region: process.env.AWS_REGION || 'us-east-1',
+      region: this.configService.get<string>('AWS_REGION') || 'us-east-1',
       credentials: {
         accessKeyId,
         secretAccessKey,
       },
-      endpoint: process.env.AWS_S3_ENDPOINT,
+      endpoint: this.configService.get<string>('AWS_S3_ENDPOINT'),
       forcePathStyle: true,
     });
   }
@@ -129,10 +132,34 @@ export class StorageService {
         expiresIn: 900,
       });
 
-      return { uploadUrl, fileKey };
+      return { uploadUrl };
     } catch (error: any) {
       this.logger.error('Failed to generate pre-signed URL', error?.message);
       throw new Error('Failed to generate pre-signed URL');
+    }
+  }
+
+  getProofFileKey(uploadUrl: string, userId: string, taskId: string): string {
+    let pathname: string;
+    try {
+      pathname = new URL(uploadUrl).pathname;
+    } catch {
+      throw new BadRequestException('Invalid proof upload URL');
+    }
+
+    const match = pathname.match(/(?:^|\/)(proofs\/[^/]+\/[^/]+\/[^/]+)$/);
+    const fileKey = match?.[1];
+    const keyParts = fileKey?.split('/');
+    if (!fileKey || keyParts?.[1] !== userId || keyParts?.[2] !== taskId) {
+      throw new BadRequestException(
+        'Proof upload URL does not match this user and task',
+      );
+    }
+
+    try {
+      return decodeURIComponent(fileKey);
+    } catch {
+      throw new BadRequestException('Invalid proof upload URL');
     }
   }
 

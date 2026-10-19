@@ -1,4 +1,5 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { InjectQueue } from '@nestjs/bull';
@@ -9,10 +10,15 @@ import {
   NotificationDeliveryLog,
   DeliveryStatus,
 } from './entities/notification-delivery-log.entity';
-import { InAppNotification, DeliveryChannel } from './entities/in-app-notification.entity';
+import {
+  InAppNotification,
+  DeliveryChannel,
+  NotificationTypeEnum,
+} from './entities/in-app-notification.entity';
 import { SmsService } from '../../shared/sms/sms.service';
 import { PushNotificationService } from '../../shared/notifications/services/push-notification.service';
 import { EmailTemplateService } from '../../shared/notifications/services/email-template.service';
+import { MetricsService } from '../../shared/metrics/metrics.service';
 import {
   NOTIFICATION_CENTER_QUEUE,
   RETRY_DELIVERY_JOB,
@@ -39,6 +45,9 @@ export interface RetryJobData {
 @Injectable()
 export class ChannelRouterService {
   private readonly logger = new Logger(ChannelRouterService.name);
+  private readonly circuitFailures = new Map<DeliveryChannel, number>();
+  private readonly circuitOpenedAt = new Map<DeliveryChannel, number>();
+  private readonly circuitProbeInFlight = new Set<DeliveryChannel>();
 
   constructor(
     @InjectRepository(NotificationPreference)
@@ -51,8 +60,40 @@ export class ChannelRouterService {
     private readonly retryQueue: Queue<RetryJobData>,
     private readonly smsService: SmsService,
     private readonly pushNotificationService: PushNotificationService,
-    private readonly emailTemplateService: EmailTemplateService
+    private readonly emailTemplateService: EmailTemplateService,
+    @Optional() private readonly config?: ConfigService,
+    @Optional() private readonly metrics?: MetricsService,
   ) {}
+
+  /**
+   * Helper method to check if a channel is enabled for a notification type
+   * Uses granular preferences if available, falls back to global settings
+   */
+  private isChannelEnabled(
+    preferences: NotificationPreference | null,
+    notificationType: NotificationTypeEnum,
+    channel: 'email' | 'push' | 'sms'
+  ): boolean {
+    if (!preferences) return true;
+
+    // Check granular preference first
+    const typePrefs = preferences.channelPreferences?.[notificationType];
+    if (typePrefs && typePrefs[channel] !== undefined) {
+      return typePrefs[channel];
+    }
+
+    // Fallback to global channel settings
+    switch (channel) {
+      case 'email':
+        return preferences.emailNotifications ?? true;
+      case 'push':
+        return preferences.pushNotifications ?? true;
+      case 'sms':
+        return preferences.smsNotifications ?? true;
+      default:
+        return true;
+    }
+  }
 
   /**
    * Routes a notification to all channels enabled in the user's preferences.
@@ -69,17 +110,17 @@ export class ChannelRouterService {
     }> = [
       {
         channel: DeliveryChannel.EMAIL,
-        enabled: preferences?.emailNotifications ?? true,
+        enabled: this.isChannelEnabled(preferences, notification.type, 'email'),
         send: () => this.dispatchEmail(user, notification),
       },
       {
         channel: DeliveryChannel.PUSH,
-        enabled: preferences?.pushNotifications ?? true,
+        enabled: this.isChannelEnabled(preferences, notification.type, 'push'),
         send: () => this.dispatchPush(user, notification),
       },
       {
         channel: DeliveryChannel.SMS,
-        enabled: preferences?.smsNotifications ?? true,
+        enabled: this.isChannelEnabled(preferences, notification.type, 'sms'),
         send: () => this.dispatchSms(user, notification),
       },
     ];
@@ -109,26 +150,36 @@ export class ChannelRouterService {
     const sendFn: () => Promise<void> = this.buildSendFn(channel, user, notification);
 
     try {
+      this.acquireProvider(channel);
       await sendFn();
+      this.recordProviderSuccess(channel);
       await this.updateLog(logId, DeliveryStatus.SENT, attempt, null);
       await this.markChannelDelivered(notificationId, channel);
     } catch (err: any) {
       const errorMessage: string = err?.message ?? String(err);
+      if (err?.code === 'NOTIFICATION_CIRCUIT_OPEN') {
+        this.metrics?.recordNotificationDelivery(channel, 'circuit_open');
+      } else {
+        this.recordProviderFailure(channel);
+      }
       this.logger.warn(
         `Retry attempt ${attempt}/${MAX_DELIVERY_ATTEMPTS} failed for notification ${notificationId} channel ${channel}: ${errorMessage}`
       );
 
-      if (attempt >= MAX_DELIVERY_ATTEMPTS) {
+      const circuitOpen = err?.code === 'NOTIFICATION_CIRCUIT_OPEN';
+      if (attempt >= MAX_DELIVERY_ATTEMPTS && !circuitOpen) {
         await this.updateLog(logId, DeliveryStatus.FAILED, attempt, errorMessage);
         this.logger.error(
           `Notification ${notificationId} channel ${channel} permanently failed after ${MAX_DELIVERY_ATTEMPTS} attempts`
         );
       } else {
         await this.updateLog(logId, DeliveryStatus.PENDING, attempt, errorMessage);
-        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        const delay = circuitOpen
+          ? (this.config?.get<number>('NOTIFICATION_CIRCUIT_RESET_MS', 30000) ?? 30000)
+          : RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
         await this.retryQueue.add(
           RETRY_DELIVERY_JOB,
-          { notificationId, logId, channel, userId, title, body, attempt: attempt + 1 },
+          { notificationId, logId, channel, userId, title, body, attempt: circuitOpen ? attempt : attempt + 1 },
           {
             delay,
             attempts: 1, // we manage our own retry count
@@ -136,6 +187,7 @@ export class ChannelRouterService {
             removeOnFail: 50,
           }
         );
+        this.metrics?.incrementNotificationDeliveryRetries(channel);
       }
     }
   }
@@ -154,20 +206,30 @@ export class ChannelRouterService {
     const log = await this.createLog(notification.id, channel);
 
     try {
+      this.acquireProvider(channel);
       await send();
+      this.recordProviderSuccess(channel);
       await this.updateLog(log.id, DeliveryStatus.SENT, attempt, null);
       await this.markChannelDelivered(notification.id, channel);
     } catch (err: any) {
       const errorMessage: string = err?.message ?? String(err);
+      if (err?.code === 'NOTIFICATION_CIRCUIT_OPEN') {
+        this.metrics?.recordNotificationDelivery(channel, 'circuit_open');
+      } else {
+        this.recordProviderFailure(channel);
+      }
       this.logger.warn(
         `Initial delivery failed for notification ${notification.id} channel ${channel}: ${errorMessage}`
       );
 
-      if (attempt >= MAX_DELIVERY_ATTEMPTS) {
+      const circuitOpen = err?.code === 'NOTIFICATION_CIRCUIT_OPEN';
+      if (attempt >= MAX_DELIVERY_ATTEMPTS && !circuitOpen) {
         await this.updateLog(log.id, DeliveryStatus.FAILED, attempt, errorMessage);
       } else {
         await this.updateLog(log.id, DeliveryStatus.PENDING, attempt, errorMessage);
-        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        const delay = circuitOpen
+          ? (this.config?.get<number>('NOTIFICATION_CIRCUIT_RESET_MS', 30000) ?? 30000)
+          : RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
         await this.retryQueue.add(
           RETRY_DELIVERY_JOB,
           {
@@ -177,7 +239,7 @@ export class ChannelRouterService {
             userId: user.id,
             title: notification.title,
             body: notification.body,
-            attempt: attempt + 1,
+            attempt: circuitOpen ? attempt : attempt + 1,
           },
           {
             delay,
@@ -186,7 +248,42 @@ export class ChannelRouterService {
             removeOnFail: 50,
           }
         );
+        this.metrics?.incrementNotificationDeliveryRetries(channel);
       }
+    }
+  }
+
+  private acquireProvider(channel: DeliveryChannel): void {
+    const resetMs = this.config?.get<number>('NOTIFICATION_CIRCUIT_RESET_MS', 30000) ?? 30000;
+    const openedAt = this.circuitOpenedAt.get(channel);
+    if (openedAt === undefined) return;
+    if (Date.now() - openedAt < resetMs || this.circuitProbeInFlight.has(channel)) {
+      throw Object.assign(new Error(`Notification provider circuit is open for ${channel}`), {
+        code: 'NOTIFICATION_CIRCUIT_OPEN',
+      });
+    }
+    this.circuitProbeInFlight.add(channel);
+    this.logger.warn(`Notification provider circuit allowing recovery probe for channel ${channel}`);
+  }
+
+  private recordProviderSuccess(channel: DeliveryChannel): void {
+    this.circuitFailures.delete(channel);
+    this.circuitOpenedAt.delete(channel);
+    this.circuitProbeInFlight.delete(channel);
+    this.metrics?.setNotificationCircuitOpen(channel, false);
+    this.metrics?.recordNotificationDelivery(channel, 'success');
+  }
+
+  private recordProviderFailure(channel: DeliveryChannel): void {
+    this.circuitProbeInFlight.delete(channel);
+    const failures = (this.circuitFailures.get(channel) ?? 0) + 1;
+    this.circuitFailures.set(channel, failures);
+    this.metrics?.recordNotificationDelivery(channel, 'failure');
+    const threshold = this.config?.get<number>('NOTIFICATION_CIRCUIT_FAILURE_THRESHOLD', 5) ?? 5;
+    if (failures >= Math.max(1, threshold) && !this.circuitOpenedAt.has(channel)) {
+      this.circuitOpenedAt.set(channel, Date.now());
+      this.metrics?.setNotificationCircuitOpen(channel, true);
+      this.logger.error(`Notification provider circuit opened for channel ${channel} after ${failures} failures`);
     }
   }
 

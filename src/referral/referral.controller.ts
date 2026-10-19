@@ -1,12 +1,18 @@
 import { Controller, Get, Post, Body, UseGuards, Req } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { ReferralService } from './referral.service';
+import { ReferralRewardSettlementService } from './referral-reward-settlement.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RedeemReferralDto } from './dto/redeem-referral.dto';
 
+@ApiTags('Referral')
 @Controller('users/me')
 @UseGuards(JwtAuthGuard)
 export class ReferralController {
-  constructor(private readonly referralService: ReferralService) {}
+  constructor(
+    private readonly referralService: ReferralService,
+    private readonly referralRewardSettlementService: ReferralRewardSettlementService,
+  ) {}
 
   @Get('referral-code')
   getReferralCode(@Req() req) {
@@ -16,6 +22,15 @@ export class ReferralController {
   @Get('referrals')
   getMyReferrals(@Req() req) {
     return this.referralService.getMyReferrals(req.user.id);
+  }
+
+  @Get('referral-rewards')
+  @ApiOperation({ summary: 'List settled referral rewards for the caller' })
+  @ApiResponse({ status: 200, description: 'Returns referral reward settlements' })
+  getMyReferralRewards(@Req() req) {
+    return this.referralRewardSettlementService.getMyReferralRewards(
+      req.user.id,
+    );
   }
 
   @Post('redeem-referral')

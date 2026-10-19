@@ -46,6 +46,11 @@ import { MonitoringController } from '../monitoring/monitoring.controller';
       help: 'Total number of database queries',
       labelNames: ['operation'],
     }),
+    makeCounterProvider({
+      name: 'database_slow_queries_total',
+      help: 'Number of database queries exceeding the configured slow-query threshold',
+      labelNames: ['operation'],
+    }),
     makeHistogramProvider({
       name: 'database_query_duration_seconds',
       help: 'Duration of database queries in seconds',
@@ -61,6 +66,21 @@ import { MonitoringController } from '../monitoring/monitoring.controller';
       name: 'cache_misses_total',
       help: 'Total number of cache misses',
       labelNames: ['cache_name'],
+    }),
+    makeCounterProvider({
+      name: 'notification_deliveries_total',
+      help: 'Notification provider delivery attempts by channel and outcome',
+      labelNames: ['channel', 'outcome'],
+    }),
+    makeCounterProvider({
+      name: 'notification_delivery_retries_total',
+      help: 'Notification delivery retries enqueued by channel',
+      labelNames: ['channel'],
+    }),
+    makeGaugeProvider({
+      name: 'notification_provider_circuit_state',
+      help: 'Notification provider circuit state (1=open, 0=closed)',
+      labelNames: ['channel'],
     }),
     makeGaugeProvider({
       name: 'system_memory_usage_bytes',
